@@ -1,191 +1,141 @@
 import rclpy
 from rclpy.node import Node
-
 import random
 import math
 
 from turtlesim.srv import Spawn, Kill
 from turtlesim.msg import Pose
 from geometry_msgs.msg import Twist
-
 from sheepdog_msgs.msg import Sheep, SheepArray
 
 
-# ---- Turtlesim world limits (safe margins) ----
-WORLD_MIN = 0.5
-WORLD_MAX = 10.5
-
-
 class SheepController(Node):
+
     def __init__(self):
         super().__init__('sheep_controller')
 
-        # -------- Services --------
-        self.spawn_client = self.create_client(Spawn, '/spawn')
-        self.kill_client = self.create_client(Kill, '/kill')
+        self.spawn = self.create_client(Spawn, '/spawn')
+        self.kill = self.create_client(Kill, '/kill')
 
-        while not self.spawn_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().info('Waiting for /spawn service...')
-        while not self.kill_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().info('Waiting for /kill service...')
+        while not self.spawn.wait_for_service(timeout_sec=1.0):
+            pass
+        while not self.kill.wait_for_service(timeout_sec=1.0):
+            pass
 
-        # -------- Internal state --------
-        self.sheep_names = []
-        self.sheep_positions = {}     # name -> (x, y)
-        self.sheep_vel_pubs = {}      # name -> publisher
+        self.names = []
+        self.pos = {}
+        self.pub = {}
+        self.dog = None
 
-        # -------- Spawn sheep --------
-        self.spawn_sheep()
+        for i in range(3):
+            r = Spawn.Request()
+            r.x = random.uniform(1.0, 4.0)
+            r.y = random.uniform(2.0, 9.0)
+            r.theta = 0.0
+            r.name = 'sheep' + str(i+1)
+            self.spawn.call_async(r)
+            self.names.append(r.name)
 
-        # -------- Subscribe to sheep poses --------
-        for name in self.sheep_names:
+        for n in self.names:
             self.create_subscription(
                 Pose,
-                f'/{name}/pose',
-                lambda msg, n=name: self.sheep_pose_callback(msg, n),
+                '/' + n + '/pose',
+                lambda m, k=n: self.cb_sheep(m, k),
                 10
             )
-
-            self.sheep_vel_pubs[name] = self.create_publisher(
+            self.pub[n] = self.create_publisher(
                 Twist,
-                f'/{name}/cmd_vel',
+                '/' + n + '/cmd_vel',
                 10
             )
 
-        # -------- Sheepdog (turtle1) pose --------
-        self.sheepdog_pos = None
         self.create_subscription(
             Pose,
             '/turtle1/pose',
-            self.sheepdog_callback,
+            self.cb_dog,
             10
         )
 
-        # -------- Publish sheep positions --------
-        self.sheep_pub = self.create_publisher(
+        self.out = self.create_publisher(
             SheepArray,
             '/sheep_positions',
             10
         )
 
-        # -------- Main loop --------
-        self.timer = self.create_timer(0.1, self.update)
+        self.create_timer(0.1, self.loop)
 
-        self.get_logger().info('Sheep controller running (fear + despawn + wall-safe)')
+    def cb_sheep(self, msg, name):
+        self.pos[name] = (msg.x, msg.y)
 
-    # =====================================================
-    # Spawn sheep
-    # =====================================================
-    def spawn_sheep(self):
-        for i in range(3):
-            req = Spawn.Request()
-            req.x = random.uniform(1.0, 4.0)
-            req.y = random.uniform(2.0, 9.0)
-            req.theta = 0.0
-            req.name = f'sheep{i+1}'
+    def cb_dog(self, msg):
+        self.dog = (msg.x, msg.y)
 
-            self.spawn_client.call_async(req)
-            self.sheep_names.append(req.name)
+    def loop(self):
+        self.check_kill()
+        self.move_sheep()
+        self.send_pos()
 
-            self.get_logger().info(f'Spawned {req.name}')
-
-    # =====================================================
-    # Callbacks
-    # =====================================================
-    def sheep_pose_callback(self, msg, name):
-        self.sheep_positions[name] = (msg.x, msg.y)
-
-    def sheepdog_callback(self, msg):
-        self.sheepdog_pos = (msg.x, msg.y)
-
-    # =====================================================
-    # Main update
-    # =====================================================
-    def update(self):
-        self.check_and_despawn_sheep()
-        self.apply_fear_behavior()
-        self.publish_sheep_positions()
-
-    # =====================================================
-    # Fear behavior (wall-safe)
-    # =====================================================
-    def apply_fear_behavior(self):
-        if self.sheepdog_pos is None:
+    def move_sheep(self):
+        if self.dog is None:
             return
 
-        xd, yd = self.sheepdog_pos
+        dx_d, dy_d = self.dog
 
-        for name, (xs, ys) in self.sheep_positions.items():
-            dx = xs - xd
-            dy = ys - yd
-            dist = math.sqrt(dx * dx + dy * dy)
+        for n in self.pos:
+            x, y = self.pos[n]
+            dx = x - dx_d
+            dy = y - dy_d
+            d = math.sqrt(dx*dx + dy*dy)
 
-            cmd = Twist()
+            t = Twist()
 
-            if dist < 2.0 and dist > 0.001:
-                vx = 1.5 * (dx / dist)
-                vy = 1.5 * (dy / dist)
+            if d < 2.0 and d > 0.01:
+                vx = 1.5 * dx / d
+                vy = 1.5 * dy / d
 
-                # ---- Wall / corner protection ----
-                if xs > WORLD_MAX and vx > 0:
+                if x > 10.5 and vx > 0:
                     vx = 0.0
-                if xs < WORLD_MIN and vx < 0:
+                if x < 0.5 and vx < 0:
                     vx = 0.0
-                if ys > WORLD_MAX and vy > 0:
+                if y > 10.5 and vy > 0:
                     vy = 0.0
-                if ys < WORLD_MIN and vy < 0:
+                if y < 0.5 and vy < 0:
                     vy = 0.0
 
-                cmd.linear.x = vx
-                cmd.linear.y = vy
-            else:
-                cmd.linear.x = 0.0
-                cmd.linear.y = 0.0
+                t.linear.x = vx
+                t.linear.y = vy
 
-            self.sheep_vel_pubs[name].publish(cmd)
+            self.pub[n].publish(t)
 
-    # =====================================================
-    # Despawn sheep when x > 9.0
-    # =====================================================
-    def check_and_despawn_sheep(self):
-        to_remove = []
+    def check_kill(self):
+        rem = []
+        for n in self.pos:
+            if self.pos[n][0] > 9.0:
+                rem.append(n)
 
-        for name, (x, y) in self.sheep_positions.items():
-            if x > 9.0:
-                self.get_logger().info(f'{name} reached safe zone. Despawning.')
-                to_remove.append(name)
+        for n in rem:
+            r = Kill.Request()
+            r.name = n
+            self.kill.call_async(r)
+            self.pos.pop(n, None)
+            self.pub.pop(n, None)
+            if n in self.names:
+                self.names.remove(n)
 
-        for name in to_remove:
-            req = Kill.Request()
-            req.name = name
-            self.kill_client.call_async(req)
-
-            self.sheep_positions.pop(name, None)
-            self.sheep_vel_pubs.pop(name, None)
-            if name in self.sheep_names:
-                self.sheep_names.remove(name)
-
-    # =====================================================
-    # Publish SheepArray
-    # =====================================================
-    def publish_sheep_positions(self):
-        msg = SheepArray()
-
-        for name, (x, y) in self.sheep_positions.items():
-            sheep = Sheep()
-            sheep.name = name
-            sheep.x = x
-            sheep.y = y
-            msg.sheep.append(sheep)
-
-        self.sheep_pub.publish(msg)
+    def send_pos(self):
+        m = SheepArray()
+        for n in self.pos:
+            s = Sheep()
+            s.name = n
+            s.x = self.pos[n][0]
+            s.y = self.pos[n][1]
+            m.sheep.append(s)
+        self.out.publish(m)
 
 
 def main(args=None):
     rclpy.init(args=args)
-    node = SheepController()
-    rclpy.spin(node)
-    node.destroy_node()
+    rclpy.spin(SheepController())
     rclpy.shutdown()
 
 
